@@ -1,0 +1,18 @@
+# Per-host SSH entries for bwssh.
+#
+# Managed by `bwssh add-host` and mirrored to
+# %USERPROFILE%\.ssh\bwSshBridgeHosts.conf on Windows so it survives WSL
+# reinstalls and can be copied to other machines. This file is yours.
+#
+# These entries are OS-neutral: the global `Host *` block (in ~/.ssh/config on
+# WSL and in %USERPROFILE%\.ssh\config on Windows) supplies
+# `PubkeyAuthentication unbound`, so it is not repeated per host.
+#
+# Example entry (created automatically by `bwssh add-host`):
+#
+# Host myserver
+#     HostName 10.0.0.5
+#     User alice
+#     Port 2222
+#     IdentityFile ~/.ssh/myserver.pub
+#     IdentitiesOnly yes

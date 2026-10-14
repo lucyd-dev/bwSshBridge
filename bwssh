@@ -1,0 +1,635 @@
+#!/usr/bin/env bash
+# bwssh - SSH in WSL2 via the Bitwarden Desktop SSH agent.
+#
+# Bridges the Windows OpenSSH-agent named pipe into a Unix socket so ssh/scp/
+# rsync/git authenticate with keys held only in your Bitwarden vault. The
+# private key never touches the WSL disk (or memory).
+set -euo pipefail
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+REPO_DIR="$(cd -- "$(dirname -- "$SELF")" && pwd)"
+LIB_DIR="${REPO_DIR}/lib"
+# shellcheck source=/dev/null
+. "${LIB_DIR}/common.sh"
+
+# Resolve %USERPROFILE% once in this (main) shell so command substitutions below
+# reuse the memoized value instead of spawning cmd.exe for every lookup.
+bwsh_win_home_init 2>/dev/null || true
+
+SSH_DIR="${HOME}/.ssh"
+BIN_DIR="${HOME}/.local/bin"
+CONF_DIR="${HOME}/.config/bwSshBridge"
+UNIT_DIR="${HOME}/.config/systemd/user"
+SOCK="${BW_SSH_SOCK:-${HOME}/.ssh/agent.sock}"
+DEFAULT_SERVER="https://vault.bitwarden.eu"
+
+usage() {
+  cat <<'EOF'
+bwssh - SSH in WSL2 via the Bitwarden Desktop SSH agent
+
+Usage: bwssh <command> [options]
+
+  install [--no-cli] [--no-windows] [--copy]   install bridge + CLI + ssh config
+  windows                             (re)run Windows prerequisites
+  setup-cli [--force]                 install the bw CLI and store API keys
+  login                               unlock and cache the session
+  lock                                clear the cached vault session
+  add-host <alias> <host> [user] [port] [--alias-only] [--use-key]
+                                      add/pin a host alias
+  remove-host <alias> [--delete-key]  remove a pinned host + public key; --delete-key also deletes the vault key
+  list-hosts                          list pinned hosts
+  sync-hosts [--push]                 import the Windows hosts.conf (or push to it)
+  status | doctor [--windows]         diagnose the bridge
+  uninstall                           remove the WSL-side bridge
+  version | help
+
+After add-host, connect with the alias:  ssh <alias>   (simpler than user@host)
+
+Env: BW_SSH_SOCK (socket path), NPIPERELAY (override npiperelay path),
+     BWSSH_VERBOSE=1 (show every mirrored file/block),
+     BWSSH_NO_SESSION_CACHE=1 (never cache the vault session)
+EOF
+}
+
+ensure_wsl() {
+  grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null \
+    || warn "this does not look like WSL; continuing anyway"
+}
+
+check_systemd() {
+  systemctl --user show-environment >/dev/null 2>&1 \
+    || die "the systemd --user manager is not available. In WSL, set 'systemd=true' under [boot] in /etc/wsl.conf, run 'wsl --shutdown', then retry."
+}
+
+# --- install ---------------------------------------------------------------
+
+install_socat() {
+  command -v socat >/dev/null 2>&1 && { log "socat already installed"; return 0; }
+  log "installing socat (sudo required)"
+  sudo apt-get update
+  sudo apt-get install -y socat
+}
+
+install_self() {
+  mkdir -p -- "$BIN_DIR"
+  if [[ "${INSTALL_COPY:-0}" -eq 1 ]]; then
+    local dest="${XDG_DATA_HOME:-$HOME/.local/share}/bwSshBridge"
+    rm -rf -- "$dest"
+    mkdir -p -- "$(dirname -- "$dest")"
+    cp -a -- "$REPO_DIR" "$dest"
+    ln -sf -- "${dest}/bwssh" "${BIN_DIR}/bwssh"
+    log "copied repo -> $dest (command -> ${BIN_DIR/#$HOME/\~}/bwssh)"
+  else
+    ln -sf -- "$SELF" "${BIN_DIR}/bwssh"
+    log "installed command -> ${BIN_DIR/#$HOME/\~}/bwssh"
+  fi
+}
+
+install_relay() {
+  mkdir -p -- "$BIN_DIR"
+  install -m 0755 "${LIB_DIR}/relay.sh" "${BIN_DIR}/bwSshBridgeRelay.sh"
+  log "installed relay -> ${BIN_DIR/#$HOME/\~}/bwSshBridgeRelay.sh"
+}
+
+install_unit() {
+  mkdir -p -- "$UNIT_DIR" "$SSH_DIR"
+  chmod 700 -- "$SSH_DIR"
+  local tmpl content
+  tmpl="$(cat "${REPO_DIR}/systemd/bwSshBridge.service")"
+  content="${tmpl//__BW_SSH_SOCK__/$SOCK}"
+  printf '%s\n' "$content" > "${UNIT_DIR}/bwSshBridge.service"
+  chmod 0644 -- "${UNIT_DIR}/bwSshBridge.service"
+  systemctl --user daemon-reload
+  systemctl --user enable --now bwSshBridge.service
+  log "enabled systemd --user unit bwSshBridge.service (socket $SOCK)"
+}
+
+install_completion() {
+  local dir="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"
+  mkdir -p -- "$dir"
+  install -m 0644 "${REPO_DIR}/assets/bwssh-completion.bash" "${dir}/bwssh"
+  log "installed bash completion -> ${dir/#$HOME/\~}/bwssh"
+}
+
+install_env() {
+  mkdir -p -- "$CONF_DIR"
+  printf 'export SSH_AUTH_SOCK="%s"\n' "$SOCK" > "${CONF_DIR}/env.sh"
+  chmod 0644 "${CONF_DIR}/env.sh"
+  local line='[ -f "$HOME/.config/bwSshBridge/env.sh" ] && . "$HOME/.config/bwSshBridge/env.sh"'
+  append_marked "${HOME}/.bashrc"  "$line"
+  append_marked "${HOME}/.profile" "$line"
+}
+
+install_ssh_config() {
+  mkdir -p -- "$SSH_DIR"
+  chmod 700 -- "$SSH_DIR"
+  prepend_marked "${SSH_DIR}/config" "$(cat "${REPO_DIR}/config/ssh-config.snippet")"
+  chmod 0600 -- "${SSH_DIR}/config"
+
+  local hosts win
+  hosts="$(bwsh_hosts_file)"
+  # Never clobber an existing WSL hosts file; only import/seed when it is absent.
+  if [[ ! -f "$hosts" ]]; then
+    if win="$(bwsh_win_hosts_file)" && [[ -f "$win" ]]; then
+      install -m 0600 -- "$win" "$hosts"
+      log "restored hosts from Windows -> ${hosts/#$HOME/\~}"
+    else
+      install -m 0600 "${REPO_DIR}/config/hosts.snippet" "$hosts"
+      log "seeded ${hosts/#$HOME/\~}"
+    fi
+  fi
+  # Restore any pinned public keys missing locally from the Windows mirror, then
+  # (re)write the mirror itself and the Windows ssh config block.
+  bwsh_restore_pubs_from_windows "$hosts"
+  bwsh_sync_hosts_to_windows "$hosts"
+}
+
+run_windows_prereqs() {
+  if ! command -v powershell.exe >/dev/null 2>&1; then
+    warn "powershell.exe not found; run assets/windowsSetup.ps1 on Windows manually"
+    return 0
+  fi
+  log "running Windows prerequisites (npiperelay, service + pipe checks)"
+  powershell.exe -NoProfile -Command - < "${REPO_DIR}/assets/windowsSetup.ps1" \
+    || warn "Windows prerequisite script reported issues (see output above)"
+}
+
+run_install() {
+  local with_cli=1 with_windows=1
+  INSTALL_COPY=0
+  for arg in "$@"; do
+    case "$arg" in
+      --no-cli) with_cli=0 ;;
+      --no-windows|--skip-windows) with_windows=0 ;;
+      --copy) INSTALL_COPY=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown option: $arg" ;;
+    esac
+  done
+
+  ensure_wsl
+  install_socat
+  check_systemd
+  [[ "$with_windows" -eq 1 ]] && run_windows_prereqs || log "skipping Windows prerequisites (--no-windows)"
+  install_self
+  install_relay
+  install_unit
+  install_env
+  install_ssh_config
+  install_completion
+  if [[ "$with_cli" -eq 1 ]]; then
+    if [[ -t 0 ]]; then
+      run_setup_cli || warn "Bitwarden CLI login failed; retry with: bwssh setup-cli --force"
+    else
+      run_setup_cli --install-only
+    fi
+  else
+    log "skipping Bitwarden CLI setup (--no-cli)"
+  fi
+  run_status_quiet
+  printf '\n'
+  log "done. Open a new shell (or: . ~/.config/bwSshBridge/env.sh), then:"
+  printf '      ssh-add -l && ssh <alias>   # alias from bwssh add-host\n'
+}
+
+# --- Bitwarden CLI ---------------------------------------------------------
+
+install_bw() {
+  if command -v bw >/dev/null 2>&1; then
+    log "Bitwarden CLI already installed ($(bw --version 2>/dev/null || echo '?'))"
+    return 0
+  fi
+  command -v npm >/dev/null 2>&1 \
+    || die "Node/npm not found. Install Node.js, then rerun. See https://bitwarden.com/help/cli/"
+  log "installing Bitwarden CLI (@bitwarden/cli) via npm"
+  npm install -g @bitwarden/cli
+  command -v bw >/dev/null 2>&1 || die "bw still not on PATH; ensure your npm global bin is in PATH"
+  log "installed bw $(bw --version 2>/dev/null || echo '')"
+}
+
+run_setup_cli() {
+  local env_file="${REPO_DIR}/config/bitwarden.env" force=0 install_only=0
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=1 ;;
+      --install-only) install_only=1 ;;
+      *) die "unknown option: $arg" ;;
+    esac
+  done
+  install_bw
+  [[ "$install_only" -eq 1 ]] && return 0
+  if [[ -f "$env_file" && "$force" -eq 0 ]]; then
+    log "found existing ${env_file/#$HOME/\~} (use --force to replace)"
+    return 0
+  fi
+  [[ -t 0 ]] || die "no TTY for interactive setup; create config/bitwarden.env from config/bitwarden.env.example"
+  local server cid secret
+  printf 'Create an API key: Bitwarden web vault -> Account settings -> Security -> Keys -> API key\n'
+  read -rp "Bitwarden server [${DEFAULT_SERVER}]: " server
+  server="${server:-$DEFAULT_SERVER}"
+  read -rp "API Client ID: " cid
+  read -rsp "API Client Secret: " secret
+  printf '\n'
+  [[ -n "$cid" && -n "$secret" ]] || die "client ID and secret are both required"
+  mkdir -p -- "$(dirname -- "$env_file")"
+  (
+    umask 077
+    cat > "$env_file" <<EOF
+# Bitwarden CLI credentials for bwssh. Gitignored — never commit.
+BW_SERVER=${server}
+BW_CLIENTID=${cid}
+BW_CLIENTSECRET=${secret}
+EOF
+  )
+  chmod 0600 -- "$env_file"
+  log "wrote ${env_file/#$HOME/\~} (mode 600)"
+  verify_login
+}
+
+load_bw_env() {
+  local env_file="${REPO_DIR}/config/bitwarden.env"
+  if [[ -f "$env_file" ]]; then
+    set -a
+    # shellcheck source=/dev/null
+    . "$env_file"
+    set +a
+  fi
+  : "${BW_SERVER:=${DEFAULT_SERVER}}"
+}
+
+verify_login() {
+  load_bw_env
+  bw config server "$BW_SERVER" >/dev/null 2>&1 || true
+  if bw_is_logged_in; then
+    log "already logged in"
+    return 0
+  fi
+  if [[ -n "${BW_CLIENTID:-}" && -n "${BW_CLIENTSECRET:-}" ]]; then
+    log "verifying API key (bw login --apikey)…"
+    if bw_login_apikey; then
+      log "logged in with the API key"
+      return 0
+    fi
+    warn "API-key login failed (wrong/rotated key, or wrong region: $BW_SERVER)"
+  fi
+  if [[ -t 0 ]]; then
+    warn "falling back to interactive login"
+    if bw_login_interactive >/dev/null; then
+      log "logged in interactively"
+      return 0
+    fi
+  fi
+  warn "not logged in; retry with: bwssh setup-cli --force"
+  return 1
+}
+
+run_login() {
+  require_bw
+  load_bw_env
+  # `bw config server` exits non-zero ("Logout required before server config
+  # update.") when already logged in; that is fine, so don't abort on it.
+  bw config server "$BW_SERVER" >/dev/null 2>&1 || true
+  local sess
+  if bw_is_logged_in; then
+    sess="$(bw_unlock_session)" || return 1
+  elif [[ -n "${BW_CLIENTID:-}" && -n "${BW_CLIENTSECRET:-}" ]] && bw_login_apikey; then
+    sess="$(bw_unlock_session)" || return 1
+  else
+    [[ -t 0 ]] || die "not logged in and no API key / no TTY (run: bwssh setup-cli)"
+    sess="$(bw_login_interactive)" || return 1
+  fi
+  bwsh_session_set "$sess"
+  printf '%s\n' "$sess"
+}
+
+# Use an existing BW_SESSION, the cached session, or unlock interactively.
+# The cached session is reused only while the vault is actually unlocked; if it
+# went stale (locked/logged out) the cache is dropped and we unlock once. This
+# never prompts while the session is valid, so it doesn't ask per-command.
+ensure_session() {
+  [[ -n "${BW_SESSION:-}" ]] && return 0
+  local cached
+  if cached="$(bwsh_session_get)"; then
+    if [[ "$(bw_status)" == unlocked ]]; then
+      BW_SESSION="$cached"
+      export BW_SESSION
+      return 0
+    fi
+    bwsh_session_clear
+  fi
+  [[ -t 0 ]] || die "no TTY to unlock the vault; run: bwssh login, then retry"
+  log "unlocking the vault (master password)…"
+  local sess
+  sess="$(run_login)" || die "could not unlock the vault (wrong master password?)"
+  if [[ -z "$sess" || "$sess" == *[[:space:]]* ]]; then
+    die "could not obtain a valid vault session (wrong master password?)"
+  fi
+  BW_SESSION="$sess"
+  export BW_SESSION
+  log "vault unlocked (using Bitwarden)"
+}
+
+# --- hosts -----------------------------------------------------------------
+
+run_add_host() {
+  local newkey=1 pin=0 args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --alias-only) newkey=0; shift ;;
+      --use-key) pin=1; newkey=0; shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  set -- "${args[@]}"
+  [[ $# -ge 2 ]] || die "usage: bwssh add-host <alias> <host> [user] [port] [--alias-only] [--use-key]"
+  local alias="$1" host="$2" ruser="${3:-$(id -un)}" port="${4:-22}"
+
+  mkdir -p -- "$SSH_DIR"
+  chmod 700 -- "$SSH_DIR"
+  local hosts pub="$SSH_DIR/${alias}.pub"
+  hosts="$(bwsh_hosts_file)"
+
+  if host_is_pinned "$hosts" "$alias"; then
+    if [[ "$newkey" -eq 1 ]]; then
+      die "alias \"$alias\" already exists (pinned in ${hosts/#$HOME/\~}); remove it first (bwssh remove-host $alias)"
+    fi
+    log "host \"$alias\" already pinned in ${hosts/#$HOME/\~}"
+    return 0
+  fi
+
+  if [[ "$newkey" -eq 1 ]]; then
+    require_bw
+    ensure_session
+    log "syncing Bitwarden…"
+    bw_sync_quiet
+    if [[ -n "$(bw_find_item_ids "$alias")" ]]; then
+      die "alias \"$alias\" already exists in Bitwarden; reuse it with --use-key, or delete it first (bwssh remove-host $alias --delete-key)"
+    fi
+    log "creating key \"$alias\"…"
+    local fp
+    fp="$(bw_create_ssh_item "$alias" "${alias}@$(hostname)" "$pub")"
+    printf 'Created vault item "%s" (fingerprint %s)\n' "$alias" "$fp"
+  elif [[ "$pin" -eq 1 ]]; then
+    require_bw
+    ensure_session
+    log "syncing Bitwarden…"
+    bw_sync_quiet
+    local ids=()
+    mapfile -t ids < <(bw_find_item_ids "$alias")
+    if [[ "${#ids[@]}" -eq 0 || -z "${ids[0]}" ]]; then
+      die "no vault key named \"$alias\" to use (create it first, or drop --use-key)"
+    fi
+    [[ "${#ids[@]}" -eq 1 ]] || die "multiple vault keys named \"$alias\"; resolve the duplicates first (bwssh remove-host $alias --delete-key)"
+    log "pinning key \"$alias\"…"
+    bw_get_pubkey "${ids[0]}" "$pub"
+    printf 'Pinned the public key of vault item "%s" -> %s\n' "$alias" "${pub/#$HOME/\~}"
+  fi
+
+  touch -- "$hosts"
+  chmod 600 -- "$hosts"
+  {
+    printf '\nHost %s\n' "$alias"
+    printf '    HostName %s\n' "$host"
+    printf '    User %s\n' "$ruser"
+    [[ "$port" != "22" ]] && printf '    Port %s\n' "$port"
+    if [[ "$newkey" -eq 1 || "$pin" -eq 1 ]]; then
+      # Tilde-relative so the same entry resolves on Windows (~ == %USERPROFILE%).
+      printf '    IdentityFile ~/.ssh/%s.pub\n' "$alias"
+      printf '    IdentitiesOnly yes\n'
+    fi
+  } >> "$hosts"
+  bwsh_sync_hosts_to_windows "$hosts"
+  log "pinned \"$alias\" (synced to Windows)"
+
+  if [[ "$newkey" -eq 1 || "$pin" -eq 1 ]]; then
+    printf '\nNext: authorize the key on the server (if not already done), then connect:\n'
+    printf '  ssh-copy-id -f -i ~/.ssh/%s.pub -p %s %s@%s\n' "$alias" "$port" "$ruser" "$host"
+  fi
+  printf '  ssh %s\n' "$alias"
+}
+
+run_remove_host() {
+  local delete=0 alias=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --delete-key) delete=1; shift ;;
+      -h|--help) printf 'usage: bwssh remove-host <alias> [--delete-key]\n'; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) alias="$1"; shift ;;
+    esac
+  done
+  [[ -n "$alias" ]] || die "usage: bwssh remove-host <alias> [--delete-key]"
+  local hosts
+  hosts="$(bwsh_hosts_file)"
+  [[ -f "$hosts" ]] || { warn "no hosts file"; return 0; }
+  python3 - "$hosts" "$alias" <<'PY'
+import re, sys
+path, alias = sys.argv[1], sys.argv[2]
+out, skip_block = [], False
+for line in open(path):
+    m = re.match(r'^(\s*)Host\s+(\S.*?)\s*$', line)
+    if m:
+        skip_block = False
+        indent, rest = m.group(1), m.group(2)
+        names_part, _, comment = rest.partition('#')
+        names = names_part.split()
+        if alias in names:
+            remaining = [n for n in names if n != alias]
+            if not remaining:            # last alias: drop the whole block
+                skip_block = True
+                continue
+            # keep the other aliases (and any trailing comment) in place
+            tail = (" #" + comment) if comment else ""
+            out.append(f"{indent}Host {' '.join(remaining)}{tail}\n")
+            continue
+        out.append(line)
+        continue
+    if skip_block:
+        continue
+    out.append(line)
+open(path, "w").writelines(out)
+PY
+  rm -f -- "$SSH_DIR/${alias}.pub"
+  bwsh_remove_win_pub "$alias"
+  bwsh_sync_hosts_to_windows "$hosts"
+  if [[ "$delete" -eq 1 ]]; then
+    require_bw
+    ensure_session
+    log "syncing Bitwarden…"
+    bw_sync_quiet
+    log "deleting vault item \"$alias\"…"
+    local ids=() id
+    mapfile -t ids < <(bw_find_item_ids "$alias")
+    if [[ "${#ids[@]}" -gt 0 && -n "${ids[0]}" ]]; then
+      for id in "${ids[@]}"; do
+        [[ -n "$id" ]] || continue
+        bw delete item "$id" --session "$BW_SESSION" >/dev/null
+      done
+      log "removed \"$alias\" (synced to Windows; deleted vault item)"
+    else
+      warn "no vault item named \"$alias\"; local pin removed"
+    fi
+  else
+    log "removed \"$alias\" (synced to Windows; Bitwarden item kept)"
+  fi
+}
+
+run_list_hosts() {
+  local hosts
+  hosts="$(bwsh_hosts_file)"
+  [[ -f "$hosts" ]] || { warn "no hosts file"; return 0; }
+  printf 'Origin: %s\n' "${hosts/#$HOME/\~}"
+  python3 - "$hosts" <<'PY'
+import re, sys
+path = sys.argv[1]
+KEY = {"hostname": "host", "user": "user", "port": "port", "identityfile": "key"}
+blocks = []
+for line in open(path):
+    m = re.match(r'^\s*Host\s+(\S.*?)\s*$', line)
+    if m:
+        blocks.append({"names": m.group(1).split(), "host": "", "user": "", "port": "", "key": ""})
+        continue
+    if not blocks:
+        continue
+    s = line.strip()
+    if not s or s.startswith("#"):
+        continue
+    parts = s.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() in KEY:
+        blocks[-1][KEY[parts[0].lower()]] = parts[1].strip()
+if not blocks:
+    print("  (none)")
+for b in blocks:
+    target = b["host"] or "-"
+    if b["user"]:
+        target = f'{b["user"]}@{target}'
+    port = b["port"] or "22"
+    pin = b["key"] or "alias-only"
+    for n in b["names"]:
+        print(f'  {n:<16} {target}:{port}  {pin}')
+PY
+}
+
+# Import the Windows hosts.conf (default), or push the WSL file to Windows
+# with --push. Useful after replacing the Windows copy with an older full file.
+run_sync_hosts() {
+  local push=0
+  for arg in "$@"; do
+    case "$arg" in
+      --push) push=1 ;;
+      -h|--help) printf 'usage: bwssh sync-hosts [--push]\n'; return 0 ;;
+      *) die "unknown option: $arg" ;;
+    esac
+  done
+  mkdir -p -- "$SSH_DIR"
+  chmod 700 -- "$SSH_DIR"
+  local hosts win
+  hosts="$(bwsh_hosts_file)"
+  if [[ "$push" -eq 1 ]]; then
+    [[ -f "$hosts" ]] || die "no hosts file at ${hosts/#$HOME/\~}"
+    bwsh_sync_hosts_to_windows "$hosts"
+    log "synced host config to Windows"
+  else
+    win="$(bwsh_win_hosts_file)" || die "cannot locate the Windows home"
+    [[ -f "$win" ]] || die "no Windows hosts file at $win (create it with: bwssh sync-hosts --push)"
+    install -m 0600 -- "$win" "$hosts"
+    bwsh_normalize_hosts_file "$hosts"
+    bwsh_restore_pubs_from_windows "$hosts"
+    log "imported Windows host config -> ${hosts/#$HOME/\~}"
+  fi
+}
+
+# --- status / uninstall ----------------------------------------------------
+
+status_line() { printf '  %-16s %s\n' "$1" "$2"; }
+
+run_status() {
+  local show_windows=0
+  for arg in "$@"; do
+    case "$arg" in
+      --windows) show_windows=1 ;;
+      -h|--help) printf 'usage: bwssh status [--windows]\n'; return 0 ;;
+      *) die "unknown option: $arg" ;;
+    esac
+  done
+  printf 'bwssh %s\n' "$BWSSH_VERSION"
+  printf 'Service\n'
+  if systemctl --user is-active bwSshBridge.service >/dev/null 2>&1; then
+    status_line "systemd unit" "active"
+  else
+    status_line "systemd unit" "INACTIVE (systemctl --user status bwSshBridge)"
+  fi
+  status_line "socket" "$([[ -S "$SOCK" ]] && echo "$SOCK" || echo "MISSING ($SOCK)")"
+  printf 'Agent\n'
+  if SSH_AUTH_SOCK="$SOCK" ssh-add -l >/dev/null 2>&1; then
+    SSH_AUTH_SOCK="$SOCK" ssh-add -l | sed 's/^/  /'
+  else
+    status_line "ssh-add -l" "no response (Bitwarden unlocked? SSH agent enabled?)"
+  fi
+  printf 'Bitwarden CLI\n'
+  if command -v bw >/dev/null 2>&1; then
+    status_line "bw" "$(bw --version 2>/dev/null || echo '?')"
+    status_line "config" "$([[ -f "${REPO_DIR}/config/bitwarden.env" ]] && echo 'API key stored' || echo 'no API key (bwssh setup-cli)')"
+  else
+    status_line "bw" "not installed (bwssh setup-cli)"
+  fi
+  if bwsh_session_get >/dev/null 2>&1; then
+    status_line "session" "cached (bwssh lock to clear)"
+  else
+    status_line "session" "none (bwssh login)"
+  fi
+  printf 'Hosts\n'
+  local hosts; hosts="$(bwsh_hosts_file)"
+  status_line "config" "${hosts/#$HOME/\~}$([[ -f "$hosts" ]] && echo '' || echo ' (none)')"
+  printf 'Windows\n'
+  if [[ "$show_windows" -eq 0 ]]; then
+    status_line "checks" "skipped (bwssh status --windows)"
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command - < "${REPO_DIR}/assets/windowsCheck.ps1" 2>/dev/null | sed 's/^/  /' || true
+  else
+    status_line "checks" "powershell.exe not found"
+  fi
+}
+
+run_status_quiet() {
+  if SSH_AUTH_SOCK="$SOCK" ssh-add -l >/dev/null 2>&1; then
+    log "bridge ready; keys from the vault:"
+    SSH_AUTH_SOCK="$SOCK" ssh-add -l | sed 's/^/      /'
+  else
+    warn "bridge not answering yet — is Bitwarden Desktop open, unlocked, with the SSH agent enabled?"
+  fi
+}
+
+run_uninstall() {
+  systemctl --user disable --now bwSshBridge.service 2>/dev/null || true
+  rm -f "${UNIT_DIR}/bwSshBridge.service"
+  systemctl --user daemon-reload 2>/dev/null || true
+  rm -f "${BIN_DIR}/bwSshBridgeRelay.sh" "${BIN_DIR}/bwssh"
+  strip_marked "${HOME}/.bashrc"
+  strip_marked "${HOME}/.profile"
+  strip_marked "${SSH_DIR}/config"
+  bwsh_strip_windows_ssh_config
+  bwsh_session_clear
+  rm -rf "$CONF_DIR"
+  log "uninstalled (hosts file, Windows mirror and its key pins left in place)"
+}
+
+# --- dispatch --------------------------------------------------------------
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  install)          run_install "$@" ;;
+  windows)          run_windows_prereqs "$@" ;;
+  setup-cli)        run_setup_cli "$@" ;;
+  login)            run_login >/dev/null; note "unlocked (session cached; run 'bwssh lock' to clear)" ;;
+  lock)             bwsh_session_clear; log "session cache cleared" ;;
+  add-host|addHost) run_add_host "$@" ;;
+  remove-host|removeHost) run_remove_host "$@" ;;
+  list-hosts|listHosts)   run_list_hosts "$@" ;;
+  sync-hosts|syncHosts)   run_sync_hosts "$@" ;;
+  status|doctor)    run_status "$@" ;;
+  uninstall)        run_uninstall "$@" ;;
+  version|--version|-V) printf 'bwssh %s\n' "$BWSSH_VERSION" ;;
+  help|-h|--help)   usage ;;
+  *) die "unknown command: $cmd (try: bwssh help)" ;;
+esac

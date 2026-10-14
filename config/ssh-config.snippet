@@ -1,0 +1,14 @@
+# Managed by bwssh. Global SSH settings for the Bitwarden Desktop SSH agent.
+# Safe to edit; keys live in Bitwarden.
+
+Host *
+    # OpenSSH 9.x negotiates publickey-hostbound-v00, which the Bitwarden
+    # desktop agent refuses ("agent refused operation"). This only removes
+    # replay hardening that matters for agent *forwarding* (ForwardAgent) and
+    # destination-constrained keys; direct, locally-run-agent connections are
+    # unaffected (see docs/design.md). Do not enable ForwardAgent with this.
+    PubkeyAuthentication unbound
+
+# Per-host entries (aliases, key pins) live in a separate user-owned file so
+# they survive reinstalls. Manage it with `bwssh add-host`.
+Include ~/.ssh/bwSshBridgeHosts.conf

@@ -1,0 +1,14 @@
+# Secrets — never commit
+config/bitwarden.env
+config/local.env
+*.env
+!*.env.example
+!environment.example
+
+# Local runtime
+*.sock
+*.log
+
+# Python
+__pycache__/
+*.pyc

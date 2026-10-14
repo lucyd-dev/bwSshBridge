@@ -1,0 +1,17 @@
+[Unit]
+Description=Bitwarden Desktop SSH agent bridge (Windows named pipe -> WSL2 socket)
+Documentation=https://github.com/albertony/npiperelay
+After=default.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+ConditionPathExists=%h/.local/bin/bwSshBridgeRelay.sh
+
+[Service]
+Type=simple
+Environment=SSH_AUTH_SOCK=__BW_SSH_SOCK__
+ExecStart=%h/.local/bin/bwSshBridgeRelay.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
