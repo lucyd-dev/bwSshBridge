@@ -230,7 +230,7 @@ cat > "$stub/bw" <<'SH'
 #!/usr/bin/env bash
 case "$1 $2" in
   "config server") echo "Logout required before server config update." >&2; exit 1 ;;
-  "status") echo '{"status":"locked"}'; exit 0 ;;
+  "status"*) echo '{"status":"locked"}'; exit 0 ;;
   "unlock --raw") echo "STUBSESSION"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -251,7 +251,7 @@ cat > "$stub7/bw" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$BWSSH_TEST_BWLOG"
 case "$1 $2" in
-  "status ")      echo '{"status":"unlocked"}'; exit 0 ;;
+  "status"*)      echo '{"status":"unlocked"}'; exit 0 ;;
   "unlock --raw") echo 'NEWSESSION'; exit 0 ;;
   "list items")   echo '[{"id":"ID7","name":"sesssrv","type":5}]'; exit 0 ;;
   *) exit 0 ;;
@@ -270,7 +270,7 @@ stub8="$TMP/bin-stale"; mkdir -p "$stub8"
 cat > "$stub8/bw" <<'SH'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "status ") echo '{"status":"locked"}'; exit 0 ;;
+  "status"*) echo '{"status":"locked"}'; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -286,7 +286,7 @@ cat > "$stub2/bw" <<'SH'
 #!/usr/bin/env bash
 case "$1 $2" in
   "config server") exit 0 ;;
-  "status") echo '{"status":"locked"}'; exit 0 ;;
+  "status"*) echo '{"status":"locked"}'; exit 0 ;;
   "unlock --raw") echo "ERROR bitwarden_crypto: decryption failed" >&2; exit 1 ;;
   *) exit 0 ;;
 esac
