@@ -64,7 +64,7 @@ assert_not_contains "alias-only has no IdentityFile" "$(cat "$hosts")" 'Identity
 out="$("$bwssh" add-host testsrv other.example.com x 22 --alias-only 2>&1)"; rc=$?
 assert_status "re-adding alias (--alias-only) is idempotent" "$rc" 0
 
-out="$("$bwssh" add-host testsrv other.example.com x 22 2>&1)"; rc=$?
+out="$("$bwssh" add-host testsrv other.example.com x 22 --new-key 2>&1)"; rc=$?
 assert_status "duplicate alias with key creation is rejected" "$rc" 1
 assert_contains "duplicate error mentions the alias" "$out" 'testsrv'
 
@@ -81,13 +81,32 @@ win_dir="$BWSSH_WIN_HOME/.ssh"
 win_hosts="$win_dir/bwSshBridgeHosts.conf"
 win_config="$win_dir/config"
 
-"$bwssh" add-host winsrv win.example.com tester 22 --alias-only >/dev/null 2>&1
+printf '\nHost winsrv\n    HostName win.example.com\n    User tester\n    IdentityFile ~/.ssh/winsrv.pub\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
 printf 'ssh-ed25519 AAAAwinsrv winsrv\n' > "$HOME/.ssh/winsrv.pub"
 chmod 600 "$HOME/.ssh/winsrv.pub"
 "$bwssh" sync-hosts --push >/dev/null 2>&1; rc=$?
 assert_status "sync-hosts --push exits 0" "$rc" 0
 assert_contains "windows hosts mirror written" "$(cat "$win_hosts" 2>/dev/null)" 'Host winsrv'
 assert_eq "windows key pin mirrored" "$(cat "$win_dir/winsrv.pub" 2>/dev/null)" 'ssh-ed25519 AAAAwinsrv winsrv'
+
+# alias-only entries do not mirror a same-named .pub
+printf '\nHost aliasonly\n    HostName a.example.com\n    User u\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
+printf 'ssh-ed25519 AAAAalias aliasonly\n' > "$HOME/.ssh/aliasonly.pub"
+chmod 600 "$HOME/.ssh/aliasonly.pub"
+"$bwssh" sync-hosts --push >/dev/null 2>&1
+[ ! -f "$win_dir/aliasonly.pub" ] && ok "alias-only pub is not mirrored" || bad "alias-only pub is not mirrored"
+"$bwssh" remove-host aliasonly >/dev/null 2>&1
+rm -f "$HOME/.ssh/aliasonly.pub"
+
+# a private key path is never mirrored or removed (only .pub pins are managed)
+printf '\nHost privatepin\n    HostName p.example.com\n    User u\n    IdentityFile ~/.ssh/privatekey\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
+printf 'PRIVATE\n' > "$HOME/.ssh/privatekey"
+chmod 600 "$HOME/.ssh/privatekey"
+"$bwssh" sync-hosts --push >/dev/null 2>&1
+[ ! -f "$win_dir/privatekey" ] && ok "private key path is not mirrored" || bad "private key path is not mirrored"
+"$bwssh" remove-host privatepin >/dev/null 2>&1
+[ -f "$HOME/.ssh/privatekey" ] && ok "private key path is not removed" || bad "private key path is not removed"
+rm -f "$HOME/.ssh/privatekey"
 assert_contains "windows config wrapped by markers" "$(cat "$win_config")" '# >>> bwSshBridge >>>'
 assert_contains "windows config includes mirror" "$(cat "$win_config")" "$win_hosts"
 assert_contains "windows config sets unbound" "$(cat "$win_config")" 'PubkeyAuthentication unbound'
@@ -128,25 +147,30 @@ assert_not_contains "WSL file drops absolute IdentityFile" "$wsl_hosts" "$HOME/.
 assert_contains     "mirror uses tilde IdentityFile" "$(cat "$win_hosts")" 'IdentityFile ~/.ssh/normhost.pub'
 assert_not_contains "per-host unbound stripped on normalize" "$wsl_hosts" 'PubkeyAuthentication unbound'
 
-# --- remove-host --delete-key also deletes the vault item -----------------------
+# --- remove-host --delete-key only deletes the matching vault key -----------
 stub3="$TMP/bin-del"; mkdir -p "$stub3"
+ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/delsrv"
+chmod 600 "$HOME/.ssh/delsrv.pub"
 cat > "$stub3/bw" <<'SH'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "list items")  echo '[{"id":"ITEMID-123","name":"delsrv","type":5},{"id":"ITEMID-456","name":"delsrv","type":5},{"id":"OTHER","name":"delsrv","type":1}]'; exit 0 ;;
+  "list items")
+    fp="$(ssh-keygen -lf "$HOME/.ssh/delsrv.pub" | awk '{print $2}')"
+    printf '[{"id":"ITEMID-123","name":"delsrv","type":5,"sshKey":{"keyFingerprint":"%s"}},{"id":"ITEMID-456","name":"delsrv","type":5,"sshKey":{"keyFingerprint":"%s"}},{"id":"ITEMID-WRONG","name":"delsrv","type":5,"sshKey":{"keyFingerprint":"SHA256:wrong"}},{"id":"OTHER","name":"delsrv","type":1}]\n' "$fp" "$fp"
+    exit 0 ;;
   "delete item") printf '%s\n' "$3" >> "$BWSSH_TEST_DELETED"; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
 chmod +x "$stub3/bw"
 printf '\nHost delsrv\n    HostName d.example.com\n    User u\n    IdentityFile ~/.ssh/delsrv.pub\n    IdentitiesOnly yes\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
-printf 'ssh-ed25519 AAAAdel delsrv\n' > "$HOME/.ssh/delsrv.pub"
 export BWSSH_TEST_DELETED="$TMP/deleted"; : > "$BWSSH_TEST_DELETED"
 BW_SESSION=stub PATH="$stub3:$PATH" "$bwssh" remove-host delsrv --delete-key >/dev/null 2>&1; rc=$?
 assert_status "remove-host --delete-key exits 0" "$rc" 0
 deleted="$(cat "$BWSSH_TEST_DELETED")"
-assert_contains     "the vault item id is deleted" "$deleted" 'ITEMID-123'
-assert_contains     "duplicate-named item is deleted too" "$deleted" 'ITEMID-456'
+assert_contains     "the matching vault item id is deleted" "$deleted" 'ITEMID-123'
+assert_contains     "duplicate-named matching item is deleted too" "$deleted" 'ITEMID-456'
+assert_not_contains "wrong-fingerprint item is kept" "$deleted" 'ITEMID-WRONG'
 assert_not_contains "only SSH-key items are deleted" "$deleted" 'OTHER'
 assert_not_contains "delsrv removed from hosts" "$(cat "$HOME/.ssh/bwSshBridgeHosts.conf")" 'Host delsrv'
 unset BWSSH_TEST_DELETED
@@ -163,32 +187,33 @@ esac
 SH
 chmod +x "$stub4/bw"
 export BWSSH_TEST_BWLOG="$TMP/bwlog"; : > "$BWSSH_TEST_BWLOG"
-out="$(BW_SESSION=stub PATH="$stub4:$PATH" "$bwssh" add-host dupsrv h.example.com u 22 2>&1)"; rc=$?
+out="$(BW_SESSION=stub PATH="$stub4:$PATH" "$bwssh" add-host dupsrv h.example.com u 22 --new-key 2>&1)"; rc=$?
 assert_status "add-host fails on duplicate vault item" "$rc" 1
 assert_contains "duplicate message says it exists" "$out" 'already exists'
 assert_contains "duplicate message mentions the alias" "$out" 'dupsrv'
-assert_contains "duplicate message suggests --use-key" "$out" '--use-key'
+assert_contains "duplicate message suggests --key" "$out" '--key'
 assert_contains "vault is synced before the lookup" "$(cat "$BWSSH_TEST_BWLOG")" 'sync'
 assert_not_contains "duplicate host not added locally" "$(cat "$HOME/.ssh/bwSshBridgeHosts.conf")" 'Host dupsrv'
 unset BWSSH_TEST_BWLOG
 
-# --- add-host --use-key reuses an existing vault key named like the alias -------
+# --- add-host --key reuses a named vault key, not one named after the alias --
 stub5="$TMP/bin-pin"; mkdir -p "$stub5"
 cat > "$stub5/bw" <<'SH'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "list items") echo '[{"id":"P1","name":"pinsrv","type":5}]'; exit 0 ;;
-  "get item")   echo '{"sshKey":{"publicKey":"ssh-ed25519 AAAApin pinsrv"}}'; exit 0 ;;
+  "list items") echo '[{"id":"P1","name":"SharedKey","type":5}]'; exit 0 ;;
+  "get item")   echo '{"sshKey":{"publicKey":"ssh-ed25519 AAAAkey sharedkey"}}'; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
 chmod +x "$stub5/bw"
-BW_SESSION=stub PATH="$stub5:$PATH" "$bwssh" add-host pinsrv p.example.com u 22 --use-key >/dev/null 2>&1; rc=$?
-assert_status "add-host --use-key exits 0" "$rc" 0
-assert_eq "pinned pubkey written" "$(cat "$HOME/.ssh/pinsrv.pub" 2>/dev/null)" 'ssh-ed25519 AAAApin pinsrv'
-assert_contains "pin block has IdentityFile" "$(cat "$HOME/.ssh/bwSshBridgeHosts.conf")" 'IdentityFile ~/.ssh/pinsrv.pub'
+BW_SESSION=stub PATH="$stub5:$PATH" "$bwssh" add-host pinsrv p.example.com u 22 --key sharedkey >/dev/null 2>&1; rc=$?
+assert_status "add-host --key exits 0" "$rc" 0
+assert_eq "shared pubkey written" "$(cat "$HOME/.ssh/SharedKey.pub" 2>/dev/null)" 'ssh-ed25519 AAAAkey sharedkey'
+assert_contains "pin block uses the canonical key name" "$(cat "$HOME/.ssh/bwSshBridgeHosts.conf")" 'IdentityFile ~/.ssh/SharedKey.pub'
+[ ! -f "$HOME/.ssh/pinsrv.pub" ] && ok "no alias-named pin created" || bad "no alias-named pin created"
 
-# --use-key with no matching vault key fails
+# --key with no matching vault key fails
 stub6="$TMP/bin-pinmiss"; mkdir -p "$stub6"
 cat > "$stub6/bw" <<'SH'
 #!/usr/bin/env bash
@@ -198,9 +223,33 @@ case "$1 $2" in
 esac
 SH
 chmod +x "$stub6/bw"
-out="$(BW_SESSION=stub PATH="$stub6:$PATH" "$bwssh" add-host nosrv n.example.com u 22 --use-key 2>&1)"; rc=$?
-assert_status "add-host --use-key fails without a vault key" "$rc" 1
+out="$(BW_SESSION=stub PATH="$stub6:$PATH" "$bwssh" add-host nosrv n.example.com u 22 --key missing 2>&1)"; rc=$?
+assert_status "add-host --key fails without a vault key" "$rc" 1
 assert_contains "missing key message" "$out" 'no vault key named'
+
+# --use-key is gone
+out="$(BW_SESSION=stub PATH="$stub6:$PATH" "$bwssh" add-host legacy l.example.com u 22 --use-key 2>&1)"; rc=$?
+assert_status "--use-key is rejected" "$rc" 1
+assert_contains "rejection points at --key" "$out" '--key'
+
+# a failed vault read must not truncate a shared pin
+stub_fail="$TMP/bin-getfail"; mkdir -p "$stub_fail"
+cat > "$stub_fail/bw" <<'SH'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "list items") echo '[{"id":"K1","name":"keep","type":5}]'; exit 0 ;;
+  "get item")   exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$stub_fail/bw"
+printf 'OLD\n' > "$HOME/.ssh/keep.pub"; chmod 600 "$HOME/.ssh/keep.pub"
+printf '\nHost keepref\n    HostName k.example.com\n    User u\n    IdentityFile ~/.ssh/keep.pub\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
+out="$(BW_SESSION=stub PATH="$stub_fail:$PATH" "$bwssh" add-host getfail g.example.com u 22 --key keep 2>&1)"; rc=$?
+assert_status "failed key read aborts add-host" "$rc" 1
+assert_eq "existing pin is not truncated" "$(cat "$HOME/.ssh/keep.pub" 2>/dev/null)" 'OLD'
+"$bwssh" remove-host keepref >/dev/null 2>&1
+rm -f "$HOME/.ssh/keep.pub"
 
 # --- remove-host keeps sibling aliases on a shared Host line ----------------
 printf '\nHost keepme dropme\n    HostName shared.example.com\n    User u\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
@@ -212,11 +261,97 @@ assert_not_contains "removed alias is gone" "$h" 'dropme'
 "$bwssh" remove-host keepme >/dev/null 2>&1
 assert_not_contains "last alias drops its block" "$(cat "$HOME/.ssh/bwSshBridgeHosts.conf")" 'shared.example.com'
 
-# --- list-hosts shows target and pin state ----------------------------------
+# --- list-hosts shows target, pin and default state -------------------------
 out="$("$bwssh" list-hosts 2>&1)"
 assert_contains "list-hosts shows alias" "$out" 'pinsrv'
 assert_contains "list-hosts shows target" "$out" 'p.example.com'
-assert_contains "list-hosts shows the pinned key" "$out" 'pinsrv.pub'
+assert_contains "list-hosts shows the pinned key" "$out" 'SharedKey.pub'
+assert_contains "list-hosts shows the default" "$out" 'Default key: (none)'
+
+# --- default key: required when neither --key nor --new-key is given --------
+"$bwssh" default-key --clear >/dev/null 2>&1
+out="$("$bwssh" add-host nodefault n.example.com u 22 2>&1)"; rc=$?
+assert_status "add-host without a key or default fails" "$rc" 1
+assert_contains "error offers --key" "$out" '--key'
+assert_contains "error offers --new-key" "$out" '--new-key'
+assert_contains "error offers default-key" "$out" 'default-key'
+
+stub9="$TMP/bin-def"; mkdir -p "$stub9"
+cat > "$stub9/bw" <<'SH'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "list items") echo '[{"id":"D1","name":"defkey","type":5}]'; exit 0 ;;
+  "get item")   echo '{"sshKey":{"publicKey":"ssh-ed25519 AAAAdef defkey"}}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$stub9/bw"
+BW_SESSION=stub PATH="$stub9:$PATH" "$bwssh" default-key defkey >/dev/null 2>&1; rc=$?
+assert_status "default-key sets a default" "$rc" 0
+assert_eq "default-key prints the stored name" "$("$bwssh" default-key 2>/dev/null)" 'defkey'
+out="$(BW_SESSION=stub PATH="$stub9:$PATH" "$bwssh" add-host defsrv d.example.com u 22 2>&1)"; rc=$?
+assert_status "add-host uses the default key" "$rc" 0
+assert_contains "add-host announces the default" "$out" 'using default key "defkey"'
+assert_contains "default key is pinned by name" "$(cat "$HOME/.ssh/bwSshBridgeHosts.conf")" 'IdentityFile ~/.ssh/defkey.pub'
+assert_eq "default pin written" "$(cat "$HOME/.ssh/defkey.pub" 2>/dev/null)" 'ssh-ed25519 AAAAdef defkey'
+out="$(BW_SESSION=stub PATH="$stub6:$PATH" "$bwssh" default-key nope 2>&1)"; rc=$?
+assert_status "default-key rejects a missing vault key" "$rc" 1
+"$bwssh" remove-host defsrv >/dev/null 2>&1
+[ -f "$HOME/.ssh/defkey.pub" ] && ok "default pin kept by remove-host" || bad "default pin kept by remove-host"
+"$bwssh" default-key --clear >/dev/null 2>&1
+rm -f "$HOME/.ssh/defkey.pub" "$win_dir/defkey.pub"
+assert_eq "default-key --clear removes it" "$("$bwssh" default-key 2>/dev/null)" 'none'
+
+# --- a pin shared by two hosts survives removing the first ------------------
+ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/sharedpin"
+chmod 600 "$HOME/.ssh/sharedpin.pub"
+printf '\nHost share1\n    HostName s1.example.com\n    User u\n    IdentityFile ~/.ssh/sharedpin.pub\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
+printf '\nHost share2\n    HostName s2.example.com\n    User u\n    IdentityFile ~/.ssh/sharedpin.pub\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
+"$bwssh" sync-hosts --push >/dev/null 2>&1
+"$bwssh" remove-host share1 >/dev/null 2>&1; rc=$?
+assert_status "removing one host sharing a key exits 0" "$rc" 0
+[ -f "$HOME/.ssh/sharedpin.pub" ] && ok "shared local pin kept while referenced" || bad "shared local pin kept while referenced"
+[ -f "$win_dir/sharedpin.pub" ] && ok "shared Windows pin kept while referenced" || bad "shared Windows pin kept while referenced"
+rm -f "$HOME/.ssh/sharedpin.pub"
+"$bwssh" sync-hosts >/dev/null 2>&1
+[ -f "$HOME/.ssh/sharedpin.pub" ] && ok "shared pin restored from Windows" || bad "shared pin restored from Windows"
+assert_eq "restored shared pin is mode 600" "$(stat -c '%a' "$HOME/.ssh/sharedpin.pub" 2>/dev/null)" '600'
+"$bwssh" remove-host share2 >/dev/null 2>&1
+[ ! -f "$HOME/.ssh/sharedpin.pub" ] && ok "shared local pin removed with the last host" || bad "shared local pin removed with the last host"
+[ ! -f "$win_dir/sharedpin.pub" ] && ok "shared Windows pin removed with the last host" || bad "shared Windows pin removed with the last host"
+
+# --- --delete-key never deletes a shared or default key ---------------------
+ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/shareddel"
+chmod 600 "$HOME/.ssh/shareddel.pub"
+printf '\nHost del1\n    HostName d1.example.com\n    User u\n    IdentityFile ~/.ssh/shareddel.pub\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
+printf '\nHost del2\n    HostName d2.example.com\n    User u\n    IdentityFile ~/.ssh/shareddel.pub\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
+stub10="$TMP/bin-shared-del"; mkdir -p "$stub10"
+cat > "$stub10/bw" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$BWSSH_TEST_DELETED2"
+case "$1 $2" in
+  "list items")
+    fp="$(ssh-keygen -lf "$HOME/.ssh/shareddel.pub" | awk '{print $2}')"
+    printf '[{"id":"SHAREDDEL","name":"shareddel","type":5,"sshKey":{"keyFingerprint":"%s"}}]\n' "$fp"
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$stub10/bw"
+export BWSSH_TEST_DELETED2="$TMP/deleted2"; : > "$BWSSH_TEST_DELETED2"
+BW_SESSION=stub PATH="$stub10:$PATH" "$bwssh" default-key shareddel >/dev/null 2>&1
+BW_SESSION=stub PATH="$stub10:$PATH" "$bwssh" remove-host del1 --delete-key >/dev/null 2>&1; rc=$?
+assert_status "remove-host --delete-key with a shared pin exits 0" "$rc" 0
+assert_eq "shared key not deleted while referenced" "$(grep -c 'delete item' "$BWSSH_TEST_DELETED2")" '0'
+[ -f "$HOME/.ssh/shareddel.pub" ] && ok "shared pin kept by --delete-key" || bad "shared pin kept by --delete-key"
+BW_SESSION=stub PATH="$stub10:$PATH" "$bwssh" remove-host del2 --delete-key >/dev/null 2>&1; rc=$?
+assert_status "remove-host --delete-key on the last user exits 0" "$rc" 0
+assert_eq "default key not deleted by --delete-key" "$(grep -c 'delete item' "$BWSSH_TEST_DELETED2")" '0'
+[ -f "$HOME/.ssh/shareddel.pub" ] && ok "default pin kept by --delete-key" || bad "default pin kept by --delete-key"
+assert_eq "default survives remove-host" "$("$bwssh" default-key 2>/dev/null)" 'shareddel'
+"$bwssh" default-key --clear >/dev/null 2>&1
+rm -f "$HOME/.ssh/shareddel.pub" "$win_dir/shareddel.pub"
+unset BWSSH_TEST_DELETED2
 
 # --- sync-hosts tolerates a missing Windows home ---------------------------
 "$bwssh" sync-hosts --push >/dev/null 2>&1; rc=$?
@@ -246,6 +381,9 @@ assert_eq "login caches the session" "$(cat "$sess_file" 2>/dev/null)" 'STUBSESS
 
 # a cached session is reused while the vault is unlocked (no re-unlock)...
 mkdir -p "$(dirname "$sess_file")"; printf 'CACHED\n' > "$sess_file"; chmod 600 "$sess_file"
+ssh-keygen -q -t ed25519 -N '' -f "$HOME/.ssh/sesssrv"
+chmod 600 "$HOME/.ssh/sesssrv.pub"
+printf '\nHost sesssrv\n    HostName s.example.com\n    User u\n    IdentityFile ~/.ssh/sesssrv.pub\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
 stub7="$TMP/bin-sess"; mkdir -p "$stub7"
 cat > "$stub7/bw" <<'SH'
 #!/usr/bin/env bash
@@ -253,7 +391,10 @@ printf '%s\n' "$*" >> "$BWSSH_TEST_BWLOG"
 case "$1 $2" in
   "status"*)      echo '{"status":"unlocked"}'; exit 0 ;;
   "unlock --raw") echo 'NEWSESSION'; exit 0 ;;
-  "list items")   echo '[{"id":"ID7","name":"sesssrv","type":5}]'; exit 0 ;;
+  "list items")
+    fp="$(ssh-keygen -lf "$HOME/.ssh/sesssrv.pub" | awk '{print $2}')"
+    printf '[{"id":"ID7","name":"sesssrv","type":5,"sshKey":{"keyFingerprint":"%s"}}]\n' "$fp"
+    exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -266,6 +407,7 @@ assert_not_contains "no re-unlock while unlocked" "$(cat "$BWSSH_TEST_BWLOG")" '
 
 # ...but a stale cache (vault locked) is dropped, not trusted
 printf 'STALE\n' > "$sess_file"; chmod 600 "$sess_file"
+printf '\nHost sesssrv\n    HostName s.example.com\n    User u\n    IdentityFile ~/.ssh/sesssrv.pub\n' >> "$HOME/.ssh/bwSshBridgeHosts.conf"
 stub8="$TMP/bin-stale"; mkdir -p "$stub8"
 cat > "$stub8/bw" <<'SH'
 #!/usr/bin/env bash
@@ -303,6 +445,10 @@ assert_contains "version prints name" "$("$bwssh" version)" 'bwssh'
 "$bwssh" help >/dev/null 2>&1; assert_status "help exits 0" "$?" 0
 out="$("$bwssh" nonsense 2>&1)"; rc=$?
 assert_status "unknown command fails" "$rc" 1
+out="$("$bwssh" remove-host '*' 2>&1)"; rc=$?
+assert_status "wildcard remove-host is rejected" "$rc" 1
+out="$("$bwssh" add-host '*' h.example.com u 22 --alias-only 2>&1)"; rc=$?
+assert_status "wildcard add-host is rejected" "$rc" 1
 
 # --- systemd unit -----------------------------------------------------------
 if command -v systemd-analyze >/dev/null 2>&1; then

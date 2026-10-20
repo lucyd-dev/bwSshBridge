@@ -36,30 +36,54 @@ ssh myserver      # your alias from `bwssh add-host` (below) — no -i, no key f
 
 The alias is simpler to remember than `user@host`.
 
-## Add a host
+## Keys and hosts
+
+bwssh is built around shared keys: one vault key can back any number of hosts.
+Set a default once:
+
+```bash
+bwssh default-key sharedkey     # must name an existing SSH key in your vault
+```
+
+Then add hosts without repeating the key:
 
 ```bash
 bwssh add-host myserver host.example.com alice 2222
+# using default key "sharedkey"
 ```
 
-This creates a vault item `myserver`, pins the key in
-`~/.ssh/bwSshBridgeHosts.conf`, and prints the one-time `ssh-copy-id` to
-authorize it on the server. Then just `ssh myserver`. It syncs your vault first
-and refuses an alias that already exists (locally or in Bitwarden). Variants:
+This pins the key in `~/.ssh/bwSshBridgeHosts.conf` and prints the one-time
+`ssh-copy-id` to authorize it on the server. Then just `ssh myserver`. It syncs
+your vault first; re-adding an existing alias is a no-op. Variants:
 
+- `--key <vault-item>` — use a specific shared key for this host (does not
+  change the default).
+- `--new-key` — create a fresh vault key just for this host, named after the
+  alias.
 - `--alias-only` — alias only, no key pin, no vault access.
-- `--use-key` — reuse the key already in your vault under this alias (same name).
 
-`bwssh remove-host <alias>` removes the alias and its pinned public key locally
-and from the Windows mirror — but it **does not delete the key from Bitwarden**.
-Remove the vault item in the Bitwarden app separately, or pass `--delete-key` to
-`remove-host` to delete the vault item with the same name too.
+With no default set and neither `--key` nor `--new-key`, `add-host` refuses and
+tells you what to pass. Manage the default with `bwssh default-key` (prints it),
+`bwssh default-key <vault-item>`, or `bwssh default-key --clear`.
+
+Pins are referenced by key name (`IdentityFile ~/.ssh/sharedkey.pub`), so every
+host using a key shares the same pin.
+
+`bwssh remove-host <alias>` removes the alias and, unless it is the default,
+the pinned public key once no other host references it, locally and from the
+Windows mirror. It **does not delete the key from Bitwarden** unless you pass
+`--delete-key`. With
+`--delete-key`, the vault item is deleted only when the removed host was the
+last one using it, the item's fingerprint matches the pin, and the key is not
+the current default. **The default key is never deleted by `remove-host`.** To
+remove it, clear the default first (`bwssh default-key --clear`) and then remove
+the host, or delete the item in Bitwarden.
 
 ### Unlocking Bitwarden
 
-Commands that read or write your vault (`add-host`, `remove-host --delete-key`)
-need it unlocked. Instead of typing your master password every time,
-unlock once:
+Commands that read or write your vault (`add-host` unless `--alias-only`,
+`default-key <vault-item>`, `remove-host --delete-key`) need it unlocked.
+Instead of typing your master password every time, unlock once:
 
 ```bash
 bwssh login        # asks for the master password once
@@ -70,15 +94,17 @@ bwssh lock         # forget the session (also cleared on reboot)
 `bwssh login` caches the session token in memory only (`$XDG_RUNTIME_DIR`, mode
 600 — never on disk) and `bwssh lock` clears it. Set `BWSSH_NO_SESSION_CACHE=1`
 to disable caching (commands then prompt each time). Commands that never touch
-the vault (`--alias-only`, plain `remove-host`, `sync-hosts`) never prompt.
+the vault (`--alias-only`, plain `remove-host`, `sync-hosts`, `default-key`
+without an item) never prompt.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
 | `install [--no-cli] [--no-windows] [--copy]` | install bridge + Windows prereqs + CLI + ssh config; `--no-cli` skips the `bw` CLI, `--no-windows` skips Windows prereqs, `--copy` copies the repo instead of symlinking |
-| `add-host <alias> <host> [user] [port] [--alias-only] [--use-key]` | add/pin a host; `--alias-only` alias only, `--use-key` reuse the existing vault key named like the alias |
-| `remove-host <alias> [--delete-key]` | remove the local pin; `--delete-key` also deletes the vault item |
+| `add-host <alias> <host> [user] [port] [--key <vault-item> \| --new-key \| --alias-only]` | add/pin a host; uses the default key if set, `--key` picks a shared key, `--new-key` creates a per-host key, `--alias-only` pins no key |
+| `default-key [<vault-item>] [--clear]` | show, set or clear the default shared key used by `add-host` |
+| `remove-host <alias> [--delete-key]` | remove the host and any pin no other host uses; `--delete-key` also deletes its vault key when it is the last user |
 | `list-hosts` | list pinned hosts |
 | `sync-hosts [--push]` | import the Windows mirror; `--push` mirrors WSL → Windows |
 | `status [--windows]` / `doctor` | diagnose; `--windows` runs Windows checks |
@@ -92,7 +118,7 @@ Set `BWSSH_VERBOSE=1` to see every mirrored file and config block (off by defaul
 
 ## Windows ssh and VS Code
 
-Host entries and pinned public keys are mirrored to `%USERPROFILE%\.ssh\`, and
+Host entries and every public key they pin are mirrored to `%USERPROFILE%\.ssh\`, and
 `bwssh install` prepends a marker-wrapped `Host *` + `Include` block to
 `%USERPROFILE%\.ssh\config` (your other entries are preserved). So Windows-native
 `ssh <alias>` and **VS Code Remote-SSH** use the same aliases and keys as WSL.
@@ -111,6 +137,9 @@ leaves the mirror in place.
 - The **vault session** cached by `bwssh login` lives only in tmpfs (RAM), mode
   600, and is cleared by `bwssh lock` or reboot — never written to disk
   (`BWSSH_NO_SESSION_CACHE=1` disables it).
+- A **shared key** trades blast radius for simplicity: a server that trusts it
+  can reach every other server that trusts it. Use `--new-key` for hosts that
+  should be isolated (for example a hypervisor's root account).
 
 ## Troubleshooting
 

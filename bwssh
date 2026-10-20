@@ -23,6 +23,30 @@ UNIT_DIR="${HOME}/.config/systemd/user"
 SOCK="${BW_SSH_SOCK:-${HOME}/.ssh/agent.sock}"
 DEFAULT_SERVER="https://vault.bitwarden.eu"
 
+# The default shared key is just a vault item name, never secret material.
+default_key_file() { printf '%s\n' "${CONF_DIR}/default-key"; }
+get_default_key() {
+  local file key
+  file="$(default_key_file)"
+  [[ -f "$file" ]] || return 1
+  key="$(head -n 1 -- "$file")"
+  [[ -n "$key" ]] || return 1
+  printf '%s\n' "$key"
+}
+set_default_key() {
+  local key="$1" file
+  file="$(default_key_file)"
+  mkdir -p -- "$CONF_DIR"
+  printf '%s\n' "$key" > "$file"
+  chmod 0644 -- "$file"
+}
+clear_default_key() { rm -f -- "$(default_key_file)"; }
+
+# A key name becomes an unquoted IdentityFile basename, so keep it simple.
+key_name_is_safe() {
+  [[ -n "$1" && "$1" != -* && "$1" != */* && "$1" != *\\* && "$1" != *[[:space:]]* && "$1" != *[\*\?]* ]]
+}
+
 usage() {
   cat <<'EOF'
 bwssh - SSH in WSL2 via the Bitwarden Desktop SSH agent
@@ -34,9 +58,12 @@ Usage: bwssh <command> [options]
   setup-cli [--force]                 install the bw CLI and store API keys
   login                               unlock and cache the session
   lock                                clear the cached vault session
-  add-host <alias> <host> [user] [port] [--alias-only] [--use-key]
-                                      add/pin a host alias
-  remove-host <alias> [--delete-key]  remove a pinned host + public key; --delete-key also deletes the vault key
+  add-host <alias> <host> [user] [port] [--key <vault-item> | --new-key | --alias-only]
+                                      add/pin a host alias (uses the default key if set)
+  default-key [<vault-item>] [--clear]
+                                      show, set or clear the default shared key
+  remove-host <alias> [--delete-key]  remove a host; --delete-key also deletes its
+                                      vault key when no other host uses it
   list-hosts                          list pinned hosts
   sync-hosts [--push]                 import the Windows hosts.conf (or push to it)
   status | doctor [--windows]         diagnose the bridge
@@ -332,57 +359,98 @@ ensure_session() {
 # --- hosts -----------------------------------------------------------------
 
 run_add_host() {
-  local newkey=1 pin=0 args=()
+  local mode="" keyname="" default_used=0 args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --alias-only) newkey=0; shift ;;
-      --use-key) pin=1; newkey=0; shift ;;
+      --alias-only)
+        [[ -z "$mode" ]] || die "choose one of --key, --new-key, --alias-only"
+        mode=none; shift ;;
+      --new-key)
+        [[ -z "$mode" ]] || die "choose one of --key, --new-key, --alias-only"
+        mode=new; shift ;;
+      --key|--key=*)
+        [[ -z "$mode" ]] || die "choose one of --key, --new-key, --alias-only"
+        mode=shared
+        if [[ "$1" == --key=* ]]; then
+          keyname="${1#--key=}"; shift
+        else
+          shift
+          [[ $# -gt 0 && "$1" != -* ]] || die "--key needs a vault item name"
+          keyname="$1"; shift
+        fi
+        [[ -n "$keyname" ]] || die "--key needs a vault item name" ;;
+      -h|--help)
+        printf 'usage: bwssh add-host <alias> <host> [user] [port] [--key <vault-item> | --new-key | --alias-only]\n'
+        return 0 ;;
+      -*) die "unknown option: $1 (use --key <vault-item>, --new-key, or --alias-only)" ;;
       *) args+=("$1"); shift ;;
     esac
   done
   set -- "${args[@]}"
-  [[ $# -ge 2 ]] || die "usage: bwssh add-host <alias> <host> [user] [port] [--alias-only] [--use-key]"
+  [[ $# -ge 2 ]] || die "usage: bwssh add-host <alias> <host> [user] [port] [--key <vault-item> | --new-key | --alias-only]"
   local alias="$1" host="$2" ruser="${3:-$(id -un)}" port="${4:-22}"
+  [[ "$alias" != *[\*\?]* ]] || die "alias must not contain wildcards"
 
   mkdir -p -- "$SSH_DIR"
   chmod 700 -- "$SSH_DIR"
-  local hosts pub="$SSH_DIR/${alias}.pub"
-  hosts="$(bwsh_hosts_file)"
+  local hosts; hosts="$(bwsh_hosts_file)"
 
   if host_is_pinned "$hosts" "$alias"; then
-    if [[ "$newkey" -eq 1 ]]; then
+    if [[ "$mode" == "new" ]]; then
       die "alias \"$alias\" already exists (pinned in ${hosts/#$HOME/\~}); remove it first (bwssh remove-host $alias)"
     fi
     log "host \"$alias\" already pinned in ${hosts/#$HOME/\~}"
     return 0
   fi
 
-  if [[ "$newkey" -eq 1 ]]; then
+  if [[ -z "$mode" ]]; then
+    if keyname="$(get_default_key)"; then
+      mode=shared
+      default_used=1
+      log "using default key \"$keyname\""
+    else
+      die "no key selected: pass --key <vault-item>, --new-key, or set a default with 'bwssh default-key <vault-item>'"
+    fi
+  fi
+
+  local pin="" id canonical
+  if [[ "$mode" == "shared" ]]; then
+    require_bw
+    ensure_session
+    log "syncing Bitwarden…"
+    bw_sync_quiet
+    local items=()
+    mapfile -t items < <(bw_find_ssh_items "$keyname")
+    if [[ "${#items[@]}" -eq 0 || -z "${items[0]}" ]]; then
+      if [[ "$default_used" -eq 1 ]]; then
+        die "default key \"$keyname\" was not found in the vault; pass --key <name> or set a new default with 'bwssh default-key'"
+      fi
+      die "no vault key named \"$keyname\" (use --new-key to create one)"
+    fi
+    [[ "${#items[@]}" -eq 1 ]] || die "multiple vault keys named \"$keyname\"; resolve the duplicates first"
+    id="${items[0]%%$'\t'*}"
+    canonical="${items[0]#*$'\t'}"
+    [[ -n "$canonical" ]] || canonical="$keyname"
+    keyname="$canonical"
+    key_name_is_safe "$keyname" || die "vault key name \"$keyname\" cannot be used as a pin (no spaces, slashes or wildcards)"
+    pin="${keyname}.pub"
+    log "pinning shared key \"$keyname\"…"
+    bw_get_pubkey "$id" "${SSH_DIR}/${pin}" \
+      || die "could not read the public key of \"$keyname\" from the vault"
+  elif [[ "$mode" == "new" ]]; then
+    key_name_is_safe "$alias" || die "alias \"$alias\" cannot be used as a key name (no spaces, slashes or wildcards); use --key <name> instead"
     require_bw
     ensure_session
     log "syncing Bitwarden…"
     bw_sync_quiet
     if [[ -n "$(bw_find_item_ids "$alias")" ]]; then
-      die "alias \"$alias\" already exists in Bitwarden; reuse it with --use-key, or delete it first (bwssh remove-host $alias --delete-key)"
+      die "alias \"$alias\" already exists in Bitwarden; reuse it with --key <name>, or delete it first (bwssh remove-host $alias --delete-key)"
     fi
     log "creating key \"$alias\"…"
     local fp
-    fp="$(bw_create_ssh_item "$alias" "${alias}@$(hostname)" "$pub")"
+    fp="$(bw_create_ssh_item "$alias" "${alias}@$(hostname)" "${SSH_DIR}/${alias}.pub")"
     printf 'Created vault item "%s" (fingerprint %s)\n' "$alias" "$fp"
-  elif [[ "$pin" -eq 1 ]]; then
-    require_bw
-    ensure_session
-    log "syncing Bitwarden…"
-    bw_sync_quiet
-    local ids=()
-    mapfile -t ids < <(bw_find_item_ids "$alias")
-    if [[ "${#ids[@]}" -eq 0 || -z "${ids[0]}" ]]; then
-      die "no vault key named \"$alias\" to use (create it first, or drop --use-key)"
-    fi
-    [[ "${#ids[@]}" -eq 1 ]] || die "multiple vault keys named \"$alias\"; resolve the duplicates first (bwssh remove-host $alias --delete-key)"
-    log "pinning key \"$alias\"…"
-    bw_get_pubkey "${ids[0]}" "$pub"
-    printf 'Pinned the public key of vault item "%s" -> %s\n' "$alias" "${pub/#$HOME/\~}"
+    pin="${alias}.pub"
   fi
 
   touch -- "$hosts"
@@ -392,18 +460,18 @@ run_add_host() {
     printf '    HostName %s\n' "$host"
     printf '    User %s\n' "$ruser"
     [[ "$port" != "22" ]] && printf '    Port %s\n' "$port"
-    if [[ "$newkey" -eq 1 || "$pin" -eq 1 ]]; then
+    if [[ -n "$pin" ]]; then
       # Tilde-relative so the same entry resolves on Windows (~ == %USERPROFILE%).
-      printf '    IdentityFile ~/.ssh/%s.pub\n' "$alias"
+      printf '    IdentityFile ~/.ssh/%s\n' "$pin"
       printf '    IdentitiesOnly yes\n'
     fi
   } >> "$hosts"
   bwsh_sync_hosts_to_windows "$hosts"
-  log "pinned \"$alias\" (synced to Windows)"
+  log "added \"$alias\" (synced to Windows)"
 
-  if [[ "$newkey" -eq 1 || "$pin" -eq 1 ]]; then
+  if [[ -n "$pin" ]]; then
     printf '\nNext: authorize the key on the server (if not already done), then connect:\n'
-    printf '  ssh-copy-id -f -i ~/.ssh/%s.pub -p %s %s@%s\n' "$alias" "$port" "$ruser" "$host"
+    printf '  ssh-copy-id -f -i ~/.ssh/%s -p %s %s@%s\n' "$pin" "$port" "$ruser" "$host"
   fi
   printf '  ssh %s\n' "$alias"
 }
@@ -419,66 +487,135 @@ run_remove_host() {
     esac
   done
   [[ -n "$alias" ]] || die "usage: bwssh remove-host <alias> [--delete-key]"
+  [[ "$alias" != *[\*\?]* ]] || die "alias must not contain wildcards"
   local hosts
   hosts="$(bwsh_hosts_file)"
   [[ -f "$hosts" ]] || { warn "no hosts file"; return 0; }
-  python3 - "$hosts" "$alias" <<'PY'
-import re, sys
-path, alias = sys.argv[1], sys.argv[2]
-out, skip_block = [], False
-for line in open(path):
-    m = re.match(r'^(\s*)Host\s+(\S.*?)\s*$', line)
-    if m:
-        skip_block = False
-        indent, rest = m.group(1), m.group(2)
-        names_part, _, comment = rest.partition('#')
-        names = names_part.split()
-        if alias in names:
-            remaining = [n for n in names if n != alias]
-            if not remaining:            # last alias: drop the whole block
-                skip_block = True
-                continue
-            # keep the other aliases (and any trailing comment) in place
-            tail = (" #" + comment) if comment else ""
-            out.append(f"{indent}Host {' '.join(remaining)}{tail}\n")
-            continue
-        out.append(line)
-        continue
-    if skip_block:
-        continue
-    out.append(line)
-open(path, "w").writelines(out)
-PY
-  rm -f -- "$SSH_DIR/${alias}.pub"
-  bwsh_remove_win_pub "$alias"
-  bwsh_sync_hosts_to_windows "$hosts"
+  if ! host_is_pinned "$hosts" "$alias"; then
+    warn "no host alias \"$alias\" in ${hosts/#$HOME/\~}"
+    return 0
+  fi
+
+  # Unlock before editing so an aborted vault session leaves the host in place
+  # instead of half-removed.
   if [[ "$delete" -eq 1 ]]; then
     require_bw
     ensure_session
     log "syncing Bitwarden…"
     bw_sync_quiet
-    log "deleting vault item \"$alias\"…"
-    local ids=() id
-    mapfile -t ids < <(bw_find_item_ids "$alias")
-    if [[ "${#ids[@]}" -gt 0 && -n "${ids[0]}" ]]; then
-      for id in "${ids[@]}"; do
-        [[ -n "$id" ]] || continue
-        bw delete item "$id" --session "$BW_SESSION" >/dev/null
-      done
-      log "removed \"$alias\" (synced to Windows; deleted vault item)"
-    else
-      warn "no vault item named \"$alias\"; local pin removed"
+  fi
+
+  # Remove the block(s) and print the IdentityFile values they pinned.
+  local pins
+  if ! pins="$(python3 - "$hosts" "$alias" <<'PY'
+import re, sys
+
+path, alias = sys.argv[1], sys.argv[2]
+out, pins, found, drop, collect = [], [], False, False, False
+for line in open(path):
+    m = re.match(r'^(\s*)Host\s+(\S.*?)\s*$', line)
+    if m:
+        indent, rest = m.group(1), m.group(2)
+        names_part, _, comment = rest.partition('#')
+        names = names_part.split()
+        if alias in names:
+            found = True
+            remaining = [n for n in names if n != alias]
+            drop = not remaining
+            collect = True
+            if drop:
+                continue
+            tail = (" #" + comment) if comment else ""
+            out.append(f"{indent}Host {' '.join(remaining)}{tail}\n")
+            continue
+        drop = collect = False
+        out.append(line)
+        continue
+    if collect:
+        s = line.strip()
+        if s and not s.startswith('#'):
+            m2 = re.match(r'^IdentityFile(?:\s*=\s*|\s+)(.+?)\s*$', s, re.I)
+            if m2:
+                pins.append(m2.group(1).strip().strip('"').strip("'"))
+    if drop:
+        continue
+    out.append(line)
+if not found:
+    sys.exit(3)
+with open(path, 'w') as fh:
+    fh.writelines(out)
+for pin in sorted(set(pins)):
+    print(pin)
+PY
+  )"; then
+    warn "no host alias \"$alias\" in ${hosts/#$HOME/\~}"
+    return 0
+  fi
+
+  local remaining pin name pinfile ids id dk keybase
+  # Pins still referenced by other blocks must survive.
+  remaining="$(bwsh_host_pins "$hosts")"
+  while IFS= read -r pin; do
+    [[ -n "$pin" ]] || continue
+    if ! name="$(bwsh_pin_name "$pin")"; then
+      logv "key not under ~/.ssh; leaving it alone: $pin"
+      continue
     fi
+    if grep -Fxq -- "$name" <<< "$remaining"; then
+      log "key \"${name%.pub}\" is still used by another host; kept"
+      continue
+    fi
+    keybase="${name%.pub}"
+    if dk="$(get_default_key 2>/dev/null)" && [[ "${dk,,}" == "${keybase,,}" ]]; then
+      log "key \"$keybase\" is the default key; kept"
+      continue
+    fi
+    pinfile="${SSH_DIR}/${name}"
+    if [[ "$delete" -eq 1 ]]; then
+      ids=()
+      mapfile -t ids < <(bw_find_item_ids_for_pin "${name%.pub}" "$pinfile")
+      if [[ "${#ids[@]}" -gt 0 && -n "${ids[0]}" ]]; then
+        log "deleting vault key \"${name%.pub}\"…"
+        local ok=1
+        for id in "${ids[@]}"; do
+          [[ -n "$id" ]] || continue
+          bw delete item "$id" --session "$BW_SESSION" >/dev/null || ok=0
+        done
+        if [[ "$ok" -eq 0 ]]; then
+          warn "could not delete vault key \"${name%.pub}\"; local pin kept"
+          continue
+        fi
+        log "deleted vault key \"${name%.pub}\" (no other host uses it)"
+      else
+        warn "no vault key named \"${name%.pub}\" matches ${pinfile/#$HOME/\~}; local pin removed"
+      fi
+    fi
+    rm -f -- "$pinfile"
+    bwsh_remove_win_pub "$name"
+  done <<< "$pins"
+
+  if [[ "$delete" -eq 1 && -z "$pins" ]]; then
+    warn "host \"$alias\" has no key pin; nothing to delete from Bitwarden"
+  fi
+
+  bwsh_sync_hosts_to_windows "$hosts"
+  if [[ "$delete" -eq 1 ]]; then
+    log "removed \"$alias\" (synced to Windows; unreferenced vault keys deleted)"
   else
     log "removed \"$alias\" (synced to Windows; Bitwarden item kept)"
   fi
 }
 
 run_list_hosts() {
-  local hosts
+  local hosts dk
   hosts="$(bwsh_hosts_file)"
   [[ -f "$hosts" ]] || { warn "no hosts file"; return 0; }
   printf 'Origin: %s\n' "${hosts/#$HOME/\~}"
+  if dk="$(get_default_key)"; then
+    printf 'Default key: %s\n' "$dk"
+  else
+    printf 'Default key: (none)\n'
+  fi
   python3 - "$hosts" <<'PY'
 import re, sys
 path = sys.argv[1]
@@ -487,7 +624,8 @@ blocks = []
 for line in open(path):
     m = re.match(r'^\s*Host\s+(\S.*?)\s*$', line)
     if m:
-        blocks.append({"names": m.group(1).split(), "host": "", "user": "", "port": "", "key": ""})
+        names = [n for n in m.group(1).split() if not re.search(r'[*?!]', n)]
+        blocks.append({"names": names, "host": "", "user": "", "port": "", "key": ""})
         continue
     if not blocks:
         continue
@@ -508,6 +646,52 @@ for b in blocks:
     for n in b["names"]:
         print(f'  {n:<16} {target}:{port}  {pin}')
 PY
+}
+
+run_default_key() {
+  local clear=0 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --clear) clear=1; shift ;;
+      -h|--help) printf 'usage: bwssh default-key [<vault-item>] [--clear]\n'; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        [[ -z "$name" ]] || die "only one vault item may be given"
+        name="$1"; shift ;;
+    esac
+  done
+  if [[ "$clear" -eq 1 && -n "$name" ]]; then
+    die "use either <vault-item> or --clear"
+  fi
+  if [[ "$clear" -eq 1 ]]; then
+    clear_default_key
+    log "cleared default key"
+    return 0
+  fi
+  if [[ -z "$name" ]]; then
+    if name="$(get_default_key)"; then
+      printf '%s\n' "$name"
+    else
+      printf 'none\n'
+    fi
+    return 0
+  fi
+
+  require_bw
+  ensure_session
+  log "syncing Bitwarden…"
+  bw_sync_quiet
+  local items=() canonical
+  mapfile -t items < <(bw_find_ssh_items "$name")
+  if [[ "${#items[@]}" -eq 0 || -z "${items[0]}" ]]; then
+    die "no vault key named \"$name\""
+  fi
+  [[ "${#items[@]}" -eq 1 ]] || die "multiple vault keys named \"$name\"; resolve the duplicates first"
+  canonical="${items[0]#*$'\t'}"
+  [[ -n "$canonical" ]] || canonical="$name"
+  key_name_is_safe "$canonical" || die "vault key name \"$canonical\" cannot be used as a pin (no spaces, slashes or wildcards)"
+  set_default_key "$canonical"
+  log "default key set to \"$canonical\""
 }
 
 # Import the Windows hosts.conf (default), or push the WSL file to Windows
@@ -624,6 +808,7 @@ case "$cmd" in
   login)            run_login >/dev/null; note "unlocked (session cached; run 'bwssh lock' to clear)" ;;
   lock)             bwsh_session_clear; log "session cache cleared" ;;
   add-host|addHost) run_add_host "$@" ;;
+  default-key|defaultKey) run_default_key "$@" ;;
   remove-host|removeHost) run_remove_host "$@" ;;
   list-hosts|listHosts)   run_list_hosts "$@" ;;
   sync-hosts|syncHosts)   run_sync_hosts "$@" ;;

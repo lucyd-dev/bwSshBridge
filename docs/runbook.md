@@ -32,29 +32,46 @@ scp file user@host:/path
 rsync -a ./ user@host:/path
 ```
 
-No `-i` and no local key file are needed. Multiple vault keys can trip a host's
-`MaxAuthTries`; pin one key per host with `bwssh add-host`.
+No `-i` and no local key file are needed. Pinning a key with `add-host` also
+keeps a host's `MaxAuthTries` budget tidy when the agent holds several keys.
 
-## Add a host
+## Keys and hosts
+
+One shared key is the normal setup. Set a default once:
 
 ```bash
-bwssh setup-cli                 # once
+bwssh setup-cli                     # once
+bwssh default-key sharedkey        # an existing SSH key in the vault
 bwssh add-host myserver 10.0.0.5 alice 2222
+#   using default key "sharedkey"
 #   bwssh unlocks the vault for you; then authorize the key on the server:
-#   ssh-copy-id -f -i ~/.ssh/myserver.pub -p 2222 alice@10.0.0.5
+#   ssh-copy-id -f -i ~/.ssh/sharedkey.pub -p 2222 alice@10.0.0.5
 #   ssh myserver
 ```
 
-For an existing vault key, add the alias only (no CLI, no unlock):
-`bwssh add-host myserver 10.0.0.5 alice 2222 --alias-only`. Or, to pin the key
-that already exists in the vault under that name, add `--use-key`.
+With no default set, `add-host` refuses and points at `--key` / `--new-key`;
+it never guesses. Other modes:
 
-`bwssh list-hosts` / `bwssh remove-host myserver` manage the set.
+- `--key <vault-item>` — use that shared key for this host without changing the
+  default.
+- `--new-key` — create a per-host key named after the alias (isolated mode).
+- `--alias-only` — no key pin, no vault access.
 
-The set is kept in `~/.ssh/bwSshBridgeHosts.conf` and mirrored, with the pinned
-public keys (`<alias>.pub`), into Windows' own `%USERPROFILE%\.ssh\`. If you
-replace the Windows copy with an older/fuller file, import it with
-`bwssh sync-hosts` (use `bwssh sync-hosts --push` to go the other way).
+`bwssh default-key` prints the default; `bwssh default-key --clear` removes it.
+
+`bwssh list-hosts` / `bwssh remove-host myserver` manage the set. A pin is shared
+by every host that references it, so it is only deleted when the last of those
+hosts goes, unless it is the default. `remove-host --delete-key` additionally deletes the vault item, but
+only when it is unreferenced, its fingerprint matches the pin, and it is not the
+current default. The default key is never removed by `remove-host`; clear it
+with `bwssh default-key --clear` before removing the host, or delete the item
+in Bitwarden.
+
+The set is kept in `~/.ssh/bwSshBridgeHosts.conf` and mirrored, with every
+public key it references (`<key>.pub`), into Windows' own
+`%USERPROFILE%\.ssh\`. If you replace the Windows copy with an older/fuller
+file, import it with `bwssh sync-hosts` (use `bwssh sync-hosts --push` to go the
+other way).
 
 Windows-native `ssh` and VS Code Remote-SSH read the same aliases via a
 marker-wrapped block (global `Host *` + `Include`) that `bwssh install` prepends
@@ -97,3 +114,6 @@ host rebooted, open and unlock Bitwarden Desktop first.
 ./bwssh uninstall
 ```
 The hosts file and the Windows mirror are left in place (your data).
+
+The default-key file (`~/.config/bwSshBridge/default-key`) is removed with the
+rest of `~/.config/bwSshBridge`; it contains only a key name, never key material.

@@ -157,50 +157,92 @@ if changed:
 PY
 }
 
-# Print the alias of every `Host <alias> ...` entry (skips wildcard patterns).
-bwsh_host_aliases() {
+# Print the basename of every public key pinned by an `IdentityFile` entry.
+# Keys are referenced by name, not by host alias, so one key can back many
+# hosts. Only paths under ~/.ssh are managed; anything else is left alone.
+bwsh_host_pins() {
   local file="$1"
   [[ -f "$file" ]] || return 0
-  awk '$1=="Host"{for(i=2;i<=NF;i++) if($i !~ /[*?!]/) print $i}' "$file" | sort -u
+  python3 - "$file" <<'PY'
+import os, re, sys
+
+path = sys.argv[1]
+home = os.environ.get("HOME", "").rstrip("/")
+prefixes = ("~/.ssh/", home + "/.ssh/") if home else ("~/.ssh/",)
+pins = set()
+for line in open(path):
+    s = line.strip()
+    if not s or s.startswith("#"):
+        continue
+    m = re.match(r'^IdentityFile(?:\s*=\s*|\s+)(.+?)\s*$', s, re.I)
+    if not m:
+        continue
+    val = m.group(1).strip().strip('"').strip("'")
+    for prefix in prefixes:
+        if val.startswith(prefix):
+            name = val[len(prefix):]
+            # Only public halves are ever mirrored. Never a private key path.
+            if name.endswith(".pub") and "/" not in name and "\\" not in name:
+                pins.add(name)
+            break
+for pin in sorted(pins):
+    print(pin)
+PY
 }
 
-# Copy every pinned public key (~/.ssh/<alias>.pub) next to the mirrored hosts
-# file. Only public halves are ever copied; a missing .pub (alias-only entry) is
-# skipped. Never touches a private key.
+# Turn an IdentityFile value into its basename under ~/.ssh, or fail if the
+# path is not managed by bwssh.
+bwsh_pin_name() {
+  local val="$1" pre="~/.ssh/" home_pre="${HOME}/.ssh/" name
+  [[ "$val" == *.pub ]] || return 1
+  if [[ "$val" == "$pre"* ]]; then
+    name="${val#"$pre"}"
+  elif [[ "$val" == "$home_pre"* ]]; then
+    name="${val#"$home_pre"}"
+  else
+    return 1
+  fi
+  [[ -n "$name" && "$name" != */* && "$name" != *\\* ]] || return 1
+  printf '%s\n' "$name"
+}
+
+# Copy every referenced public key next to the mirrored hosts file. Only public
+# halves are ever copied; a missing pin is skipped. Never touches a private key.
 bwsh_mirror_pubs_to_windows() {
-  local src="$1" d alias pub
+  local hosts="$1" d pin src
   d="$(bwsh_win_ssh_dir)" || return 0
   mkdir -p -- "$d"
-  while IFS= read -r alias; do
-    [[ -n "$alias" ]] || continue
-    pub="${HOME}/.ssh/${alias}.pub"
-    [[ -f "$pub" ]] || continue
-    cp -- "$pub" "${d}/${alias}.pub"
-    logv "mirrored key pin -> ${d}/${alias}.pub"
-  done < <(bwsh_host_aliases "$src")
+  while IFS= read -r pin; do
+    [[ -n "$pin" ]] || continue
+    src="${HOME}/.ssh/${pin}"
+    [[ -f "$src" ]] || { logv "skip missing pin ${pin}"; continue; }
+    cp -- "$src" "${d}/${pin}"
+    logv "mirrored key pin -> ${d}/${pin}"
+  done < <(bwsh_host_pins "$hosts")
 }
 
-# Restore any pinned public key that is missing locally from the Windows mirror
-# (same discovery rule as the mirror). Existing local keys are never overwritten.
+# Restore any referenced public key that is missing locally from the Windows
+# mirror. Existing local keys are never overwritten.
 bwsh_restore_pubs_from_windows() {
-  local src="$1" d alias local_pub win_pub
+  local hosts="$1" d pin local_pub win_pub
   d="$(bwsh_win_ssh_dir)" || return 0
-  while IFS= read -r alias; do
-    [[ -n "$alias" ]] || continue
-    local_pub="${HOME}/.ssh/${alias}.pub"
-    win_pub="${d}/${alias}.pub"
+  while IFS= read -r pin; do
+    [[ -n "$pin" ]] || continue
+    local_pub="${HOME}/.ssh/${pin}"
+    win_pub="${d}/${pin}"
     [[ -f "$local_pub" ]] && continue
     [[ -f "$win_pub" ]] || continue
     install -m 0600 -- "$win_pub" "$local_pub"
-    logv "restored key pin ${alias}.pub from Windows"
-  done < <(bwsh_host_aliases "$src")
+    logv "restored key pin ${pin} from Windows"
+  done < <(bwsh_host_pins "$hosts")
 }
 
-# Remove a pinned public key from the Windows mirror.
+# Remove one mirrored public key by basename (e.g. sharedkey.pub). Callers must
+# confirm no remaining Host block references it.
 bwsh_remove_win_pub() {
-  local alias="$1" d
+  local pin="$1" d
   d="$(bwsh_win_ssh_dir)" || return 0
-  rm -f -- "${d}/${alias}.pub"
+  rm -f -- "${d}/${pin}"
 }
 
 bwsh_sync_hosts_to_windows() {
@@ -429,12 +471,19 @@ host_is_pinned() {
 }
 
 # Write the public half of an existing vault SSH item to a file (mode 600).
+# Atomic: a failed read never truncates a pin another host may be using.
 bw_get_pubkey() {
-  local item="$1" out="$2"
-  bw get item "$item" --session "$BW_SESSION" \
-    | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["sshKey"]["publicKey"] + "\n")' \
-    > "$out"
-  chmod 0600 -- "$out"
+  local item="$1" out="$2" tmp
+  tmp="$(mktemp --tmpdir="$(dirname -- "$out")" .bwsshpub.XXXXXX)" || return 1
+  if bw get item "$item" --session "$BW_SESSION" \
+       | python3 -c 'import json,sys; sys.stdout.write(json.load(sys.stdin)["sshKey"]["publicKey"] + "\n")' \
+       > "$tmp"; then
+    chmod 0600 -- "$tmp"
+    mv -- "$tmp" "$out"
+  else
+    rm -f -- "$tmp"
+    return 1
+  fi
 }
 
 # Pull the latest vault data from the server. `bw list items` only sees the
@@ -444,9 +493,9 @@ bw_sync_quiet() {
   bw sync --session "$BW_SESSION" >/dev/null 2>&1 || true
 }
 
-# Print the ids of SSH-key vault items (type 5) whose name exactly matches
-# <name>. Handles duplicate names, where `bw get item <name>` errors out.
-bw_find_item_ids() {
+# Print "<id>\t<canonical name>" for every SSH-key vault item (type 5) whose
+# name exactly matches <name>, case-insensitively. Handles duplicate names.
+bw_find_ssh_items() {
   local name="$1"
   bw list items --search "$name" --session "$BW_SESSION" 2>/dev/null \
     | python3 -c 'import json,sys
@@ -457,7 +506,42 @@ except Exception:
     items = []
 for it in (items if isinstance(items, list) else []):
     if it.get("type") == 5 and it.get("name", "").lower() == name:
-        print(it.get("id", ""))' "$name" 2>/dev/null || true
+        print(str(it.get("id", "")) + "\t" + str(it.get("name", "")))' "$name" 2>/dev/null || true
+}
+
+# Print just the ids (callers that only need existence/duplicate detection).
+bw_find_item_ids() {
+  bw_find_ssh_items "$1" | cut -f1
+}
+
+# Print ids of SSH-key items named <name> whose key fingerprint matches
+# <pubfile>. remove-host --delete-key uses this so a key is only deleted when
+# it really is the key the removed host pinned.
+bw_find_item_ids_for_pin() {
+  local name="$1" pubfile="$2" want
+  [[ -f "$pubfile" ]] || return 1
+  want="$(ssh-keygen -lf "$pubfile" 2>/dev/null | awk '{print $2}')" || return 1
+  [[ -n "$want" ]] || return 1
+  bw list items --search "$name" --session "$BW_SESSION" 2>/dev/null \
+    | python3 -c 'import json,sys
+name = sys.argv[1].lower(); want = sys.argv[2]; pubfile = sys.argv[3]
+try:
+    items = json.load(sys.stdin)
+except Exception:
+    items = []
+try:
+    pin = open(pubfile).read().split()
+except Exception:
+    pin = []
+for it in (items if isinstance(items, list) else []):
+    if it.get("type") != 5 or it.get("name", "").lower() != name:
+        continue
+    ssh = it.get("sshKey") or {}
+    if (ssh.get("keyFingerprint") or "") == want:
+        print(it.get("id", "")); continue
+    pub = (ssh.get("publicKey") or "").split()
+    if len(pub) >= 2 and len(pin) >= 2 and pub[1] == pin[1]:
+        print(it.get("id", ""))' "$name" "$want" "$pubfile" 2>/dev/null || true
 }
 
 # Create a type-5 SSH key item from a temp keypair, without leaking material.

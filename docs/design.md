@@ -122,27 +122,61 @@ key.
 The mirror consists of three things:
 
 1. `bwSshBridgeHosts.conf` — the per-host entries, copied verbatim.
-2. `<alias>.pub` — the **public** half of every pinned key referenced by a
-   `Host <alias>` entry (public only; alias-only entries with no local key are
-   skipped). `bwsh_sync_hosts_to_windows` copies these; `run_remove_host`
-   deletes the Windows `<alias>.pub` alongside the local one.
+2. `<key>.pub` — the **public** half of every key referenced by an
+   `IdentityFile` in a `Host` entry (public only). One key can back many hosts
+   and is mirrored once; alias-only entries have no pin.
+   `bwsh_sync_hosts_to_windows` copies these; `run_remove_host` deletes a pin
+   only once no remaining host references it.
 3. A marker-wrapped block at the top of `%USERPROFILE%\.ssh\config` containing a
    global `Host *` (with `PubkeyAuthentication unbound` only when the installed
    Windows OpenSSH supports it) plus `Include <absolute Windows path>`. It is
    prepended and idempotent; everything outside the `# >>> bwSshBridge` markers is
    preserved. If `Include` is unsupported, the host entries are inlined instead.
 
-`bwssh add-host` refuses an alias that already exists — both locally (a `Host`
-entry) and in Bitwarden (an SSH-key item of the same name) — so a leftover vault
-item can't silently produce a duplicate. Because `bw list items` only reads the
-CLI's local cache, add-host and `remove-host --delete-key` run `bw sync` first, so
-items added in the desktop app or on another device are visible (best-effort: a
-sync failure, e.g. offline, is ignored). `remove-host --delete-key` removes **all**
-exact-name matching SSH-key items (duplicates included).
+### Shared keys
+
+SSH's normal model is one key per person/machine added to many servers, so the
+CLI makes shared keys the default path:
+
+- `bwssh default-key <vault-item>` validates that exactly one type-5 item has
+  that name (case-insensitively) and stores the item's canonical name in
+  `~/.config/bwSshBridge/default-key` (plain text; never key material).
+  `bwssh default-key` prints it; `--clear` removes it.
+- `bwssh add-host ...` with no key flag uses the default and logs
+  `using default key "<name>"`. If no default is set it refuses rather
+  than guessing.
+- `--key <vault-item>` pins that shared key for the host without changing the
+  default. The name is canonicalised so the pin basename matches the vault item.
+- `--new-key` creates a per-host key named after the alias (the isolated mode).
+- `--alias-only` pins no key.
+
+`add-host` fetches or refreshes the pinned public key from the vault every time,
+so a stale local pin cannot silently win. `remove-host` is reference-aware: it
+collects the pins of the block being removed, then deletes a pin locally and
+from the Windows mirror only when no remaining `Host` block references it and it
+is not the current default.
+`--delete-key` deletes vault items only when the pin is unreferenced, the
+item's `keyFingerprint` (or, failing that, its public key) matches the pin, and
+the key is not the current default; alias name alone is never sufficient. The
+default key is never removed by `remove-host` (clear the default before removing
+the last host if removal is intended). Unlock happens before the hosts file is
+edited, so an aborted session leaves the host in place.
+
+The trade-off is deliberate: a shared key lets any server that trusts it reach
+every other server that trusts it. `--new-key` is the isolation boundary for
+hosts that need one.
+
+`bwssh add-host` refuses a new alias that already exists locally when
+`--new-key` is given; for the shared/default modes re-adding an existing alias is
+idempotent. New-key mode also refuses a Bitwarden SSH-key item named after the
+alias, so a leftover vault item can't silently produce a duplicate. Because
+`bw list items` only reads the CLI's local cache, vault-touching commands run
+`bw sync` first, so items added in the desktop app or on another device are
+visible (best-effort: a sync failure, e.g. offline, is ignored).
 
 Restore is symmetric: on install, a missing WSL `bwSshBridgeHosts.conf` is
-imported from the Windows mirror, and any missing local `<alias>.pub` is restored
-(mode 600). Existing local files are never overwritten.
+imported from the Windows mirror, and any missing local pin is restored (mode
+600). Existing local files are never overwritten.
 
 ### Windows mirror performance
 
@@ -158,7 +192,7 @@ startup still dominates when the vault is touched).
 
 Per-host blocks are OS-neutral: they no longer carry
 `PubkeyAuthentication unbound`, and pinned keys are referenced as
-`IdentityFile ~/.ssh/<alias>.pub` (never an absolute WSL path), so the same
+`IdentityFile ~/.ssh/<key>.pub` (never an absolute WSL path), so the same
 entry resolves on Windows where `~` is `%USERPROFILE%`. Each side's prepended
 global `Host *` block supplies `unbound`, and first-match semantics make that
 win. `bwsh_normalize_hosts_file` migrates older entries on install and on every
@@ -174,7 +208,7 @@ form and strips redundant per-host `PubkeyAuthentication unbound` lines.
 - `Include` **is** supported (client-side since OpenSSH 7.3). Probed with an
   absolute Windows path, including a quoted path containing spaces; the
   fallback (inline the entries) is only used if a version probe says otherwise.
-- `~/.ssh/<alias>.pub` in a per-host block expands against `%USERPROFILE%` on
+- `~/.ssh/<key>.pub` in a per-host block expands against `%USERPROFILE%` on
   Windows, so the mirrored public keys resolve on both sides.
 - The Windows client does **not** apply the Unix private-key permission check to
   a `.pub` `IdentityFile`: a world-readable mirrored `.pub` connects without
@@ -186,7 +220,7 @@ form and strips redundant per-host `PubkeyAuthentication unbound` lines.
 `bwssh uninstall` strips the marker block from `%USERPROFILE%\.ssh\config`
 (`bwsh_strip_windows_ssh_config`), restoring the user's file to its original
 content except for the markers. The mirrored `bwSshBridgeHosts.conf` and
-`<alias>.pub` files are deliberately **left in place** — they are the portable
+`<key>.pub` files are deliberately **left in place** — they are the portable
 copies needed to restore a fresh WSL, mirroring how the WSL hosts file is
 retained.
 

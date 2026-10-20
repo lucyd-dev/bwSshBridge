@@ -8,11 +8,15 @@
 # WSL and in %USERPROFILE%\.ssh\config on Windows) supplies
 # `PubkeyAuthentication unbound`, so it is not repeated per host.
 #
+# IdentityFile names a key, not a host: many hosts may share one key. Set a
+# default with `bwssh default-key <vault-item>`; `add-host --key <name>`
+# overrides it for one host, and `--new-key` creates a per-host key.
+#
 # Example entry (created automatically by `bwssh add-host`):
 #
 # Host myserver
 #     HostName 10.0.0.5
 #     User alice
 #     Port 2222
-#     IdentityFile ~/.ssh/myserver.pub
+#     IdentityFile ~/.ssh/sharedkey.pub
 #     IdentitiesOnly yes
